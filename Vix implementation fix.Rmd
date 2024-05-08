@@ -1,0 +1,402 @@
+---
+title: "Cobe Vix Implementation"
+author: "JUIYU, CHENG"
+date: "2024-04-01"
+output: html_document
+---
+
+Youtube link here
+https://youtu.be/Q8vy2u5yW8A
+
+
+## set up environment
+```{r}
+# Load the necessary library for data manipulation
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+```
+
+## read data
+```{r}
+spx.spxw <- read.csv("C:/Users/Public/R/spx_spxw_s.csv")
+ZB <- read.csv("C:/Users/Public/R/OptionMetrics - Zero Coupon Yield Curve.csv")
+vixts <- read.csv("C:/Users/Public/R/vixts.csv")
+```
+
+
+## Convert date strings to Date objects
+```{r}
+spx.spxw$date <- as.Date(spx.spxw$date, "%Y-%m-%d")
+spx.spxw$exdate <- as.Date(spx.spxw$exdate, "%Y-%m-%d")
+
+# adjust exdate of AM settlement option
+spx.spxw <- spx.spxw %>%  mutate(exdate = ifelse(am_settlement == 1, exdate - 1, exdate))
+spx.spxw$exdate <- as.Date(spx.spxw$exdate)
+# Add a new column for days to expiration
+spx.spxw$days_to_expiration <- as.numeric(spx.spxw$exdate - spx.spxw$date)
+# adjust strike_price
+spx.spxw$strike_price <- spx.spxw$strike_price/1000
+
+# Specify the Constant Maturity Term (for example, 30 days)
+constant_maturity_term <- 30
+
+```
+
+## Find "near-term" options and "next-term" options by date
+```{r}
+date <- spx.spxw %>% select(date, exdate, days_to_expiration) %>% distinct()
+date$days_to_maturity_term <- date$days_to_expiration-30
+
+# Step 1: Arrange the data by date and the absolute value of days_to_maturity_term
+date <- date %>% arrange(date, days_to_expiration)
+
+# Step 2: Group by date and select near term and next term
+near_and_next <- date %>% group_by(date) %>% mutate(next_exdate = lead(exdate)) %>% filter(abs(days_to_maturity_term) == min(abs(days_to_maturity_term))) %>% ungroup()
+near_and_next <- near_and_next %>% group_by(date) %>% filter(days_to_expiration == min(days_to_expiration)) %>% ungroup()
+
+# View the resulting tibble
+print(near_and_next)
+```
+
+
+## Claculate the interest rate, build a term structure data
+```{r}
+# Convert the date column to Date type if it is not already
+ZB$date <- as.Date(ZB$date)
+
+# Function to interpolate and extrapolate using cubic spline
+interpolate_extrapolate <- function(days, rates, new_days) {
+  spline_fun <- splinefun(x = days, y = rates, method = "natural")
+  # Using the function to interpolate/extrapolate
+  predicted_rates <- spline_fun(new_days)
+  return(predicted_rates)
+}
+
+# Applying the function to each date group !!should be optimize further for big data
+term_structure <- ZB %>%
+  group_by(date) %>%
+  summarise(interpolated_rates = list(interpolate_extrapolate(days, rate, seq(min(days), max(days), by = 1))), .groups = 'drop')
+
+```
+
+```{r}
+# Function to get the rate given a date and time to maturity
+get_rate <- function(target_date, time_to_maturity, term_structure) {
+  # Convert target_date to Date if it is not
+  target_date <- as.Date(target_date)
+  
+  # Check if the target_date is available in the dataset
+  result <- term_structure
+  if(!target_date %in% result$date) {
+    stop("Date not found in the dataset.")
+  }
+  
+  # Extract the row corresponding to the target date
+  rates_list <- result %>%
+    filter(date == target_date) %>%
+    pull(interpolated_rates)
+  
+  # Extract the rates from the list (assuming the rates are stored for days 1 to max(days))
+  if (time_to_maturity > length(rates_list[[1]]) || time_to_maturity < 1) {
+    stop("Time to maturity is out of the available range.")
+  }
+  
+  # Return the rate corresponding to the given time to maturity
+  rate <- rates_list[[1]][time_to_maturity]
+  
+  return(rate)
+}
+
+# Example usage:
+get_rate("2022-02-28", 30, term_structure)
+```
+
+## Calculate the Single Term Variances 
+### Time to Expiration 
+```{r}
+## assume 365 days in a year
+T1 <- near_and_next$days_to_expiration/365
+T2 <- as.numeric(near_and_next$next_exdate - near_and_next$date) / 365
+T12 <- cbind(as.data.frame(as.Date(near_and_next$date)), T1, T2) %>% as.data.frame()
+names(T12) <- c("date", "T1", "T2")
+```
+
+### Forward Price and K0
+```{r}
+# Step 1: Create a subset of `near_and_next` to use for joining
+near_keys <- near_and_next %>% select(date, exdate)
+next_keys <- near_and_next %>% select(date, next_exdate)
+
+# Step 2: Perform an inner join between `spx.spxw` and `near_next_keys`
+near_data <- spx.spxw %>% inner_join(near_keys, by = c("date", "exdate"))
+names(next_keys) <-  c("date", "exdate")
+next_data <- spx.spxw %>% inner_join(next_keys, by = c("date", "exdate"))
+
+# step 3: use the middle point of bid/ask as proxmy of price, than transform it to long form data
+near_data$price <- (near_data$best_bid + near_data$best_offer)/2
+next_data$price <- (next_data$best_bid + next_data$best_offer)/2
+
+# step 4: Reshaping the data set (note that each set of date, exdate, and strike_price determine a set of put, call)
+wide_near_data <- select(near_data, date, exdate, symbol, cp_flag, strike_price, price) %>%
+  pivot_wider(
+    id_cols = c(date, exdate, strike_price),
+    names_from = cp_flag,  # Use 'cp_flag' to determine new column names
+    values_from = c(price, symbol),  # The columns to spread
+    names_sep = "_"  # Separator for new column names
+  )
+wide_next_data <- select(next_data, date, exdate, symbol, cp_flag, strike_price, price) %>%
+  pivot_wider(
+    id_cols = c(date, exdate, strike_price),
+    names_from = cp_flag,  # Use 'cp_flag' to determine new column names
+    values_from = c(price, symbol),  # The columns to spread
+    names_sep = "_"  # Separator for new column names
+  )
+
+
+# step 5: find the smallest price difference at each date, than calculate F0 and F1
+F1_data <- wide_near_data %>% group_by(date) %>% filter(abs(price_C - price_P) == min(abs(price_C - price_P))) %>% ungroup()
+F1_data <- wide_near_data %>% group_by(date) %>% filter(strike_price == min(strike_price)) %>% ungroup()
+F2_data <- wide_next_data %>% group_by(date) %>% filter(abs(price_C - price_P) == min(abs(price_C - price_P))) %>% ungroup()
+F2_data <- wide_next_data %>% group_by(date) %>% filter(strike_price == min(strike_price)) %>% ungroup()
+
+F1_data <- F1_data %>%
+  rowwise() %>% # Apply calculations row by row
+  mutate(days_to_maturity = as.integer(exdate - date),
+         rate = get_rate(date, days_to_maturity, term_structure)/100)
+F2_data <- F2_data %>%
+  rowwise() %>% # Apply calculations row by row
+  mutate(days_to_maturity = as.integer(exdate - date),
+         rate = get_rate(date, days_to_maturity, term_structure)/100) 
+
+F1_data$F1 <- F1_data$strike_price + exp(T1*F1_data$rate)*(F1_data$price_C - F1_data$price_P)
+F2_data$F2 <- F2_data$strike_price + exp(T2*F2_data$rate)*(F2_data$price_C - F2_data$price_P)
+
+
+# step 6: Find K0 for each date
+wide_near_data <- wide_near_data %>% left_join(select(F1_data, date, F1), by = c("date"))
+wide_next_data <- wide_next_data %>% left_join(select(F2_data, date, F2), by = c("date"))
+k0_near <- wide_near_data %>% group_by(date) %>% filter(strike_price <= F1) %>% filter(strike_price == max(strike_price)) %>% ungroup()
+k0_next <- wide_next_data %>% group_by(date) %>% filter(strike_price <= F2) %>% filter(strike_price == max(strike_price)) %>% ungroup()
+colnames(k0_near)[3] <- "k0"
+colnames(k0_next)[3] <- "k0"
+```
+
+## strike selection: near term
+```{r}
+near_data <- near_data %>% left_join(select(k0_near, date, k0))
+
+near_data_filtered <- near_data %>%
+  # Step 1: Remove options with null quotes
+  filter(!is.na(best_bid) & !is.na(best_offer)) %>%
+  # Step 2: Identify OTM puts and calls
+  mutate(otm_put = if_else(cp_flag == "P" & strike_price < k0, TRUE, FALSE),
+         otm_call = if_else(cp_flag == "C" & strike_price > k0, TRUE, FALSE)) %>%
+  # Step 3: Exclude non-bid options
+  filter((otm_put) | (otm_call) | strike_price == k0)
+
+#near_data_filtered %>% group_by(date) %>% arrange(strike_price, .by_group = T) %>% ungroup() %>% View()
+
+# Step 4: Handle consecutive zero bids for puts
+filtered_puts <- near_data_filtered %>%
+  filter(otm_put) %>%                      # Ensure only OTM puts are considered
+  group_by(date) %>%
+  arrange(-strike_price, .by_group = TRUE)  %>%  # Sort by strike price within each date
+  mutate(
+    consec_zero_bid = (lag(best_bid == 0, default = FALSE) & best_bid == 0), # Identify consecutive zero bids
+    exclude_after = cumsum(consec_zero_bid) >= 1  # Track the first occurrence and mark all following rows
+  ) %>% filter(!exclude_after)%>% filter(best_bid != 0) %>%
+  ungroup()
+filtered_puts$price <- (filtered_puts$best_bid + filtered_puts$best_offer)/2
+
+# Repeat Step 4 for calls
+filtered_calls <- near_data_filtered %>%
+  filter(otm_call) %>%                      # Ensure only OTM puts are considered
+  group_by(date) %>%
+  arrange(strike_price, .by_group = TRUE)  %>%  # Sort by strike price within each date
+  mutate(
+    consec_zero_bid = (lag(best_bid == 0, default = FALSE) & best_bid == 0), # Identify consecutive zero bids
+    exclude_after = cumsum(consec_zero_bid) >= 1  # Track the first occurrence and mark all following rows
+  )%>% filter(!exclude_after)%>% filter(best_bid != 0)  %>% ungroup()
+filtered_calls$price <- (filtered_calls$best_bid + filtered_calls$best_offer)/2
+filtered_calls %>% select(date, strike_price, best_bid, consec_zero_bid, exclude_after, price)
+
+# Step 5: Select options at 𝐾0 and combine all results
+options_at_k0 <- near_data_filtered %>% filter(strike_price == k0)
+options_at_k0$price <- (options_at_k0$best_bid + options_at_k0$best_offer)/2
+
+options_at_k0_wide <- pivot_wider(
+    data = options_at_k0,
+    id_cols = c(date, exdate, strike_price, k0),  # Use 'strike_price' as the identifier column
+    names_from = cp_flag,  # Use 'cp_flag' to determine new column names for 'P' and 'C'
+    values_from = price,  # The columns to spread into new columns
+    names_sep = "_"  # Separator for new column names
+) %>% mutate(cp_flag = "CP at K0", price = (C+P)/2) %>% select(date, exdate, strike_price, cp_flag, price, k0)
+
+
+
+final_data <- bind_rows(select(filtered_puts, date, exdate, strike_price, cp_flag, price, k0), 
+                        select(filtered_calls, date, exdate, strike_price, cp_flag, price, k0), 
+                        options_at_k0_wide)
+final_data %>% group_by(date, exdate) %>% arrange(strike_price, .by_group = TRUE) %>% ungroup() %>% select(date, exdate, strike_price,  cp_flag, k0, price)
+```
+
+## strike selection: next term
+```{r}
+next_data <- next_data %>% left_join(select(k0_next, date, k0))
+
+next_data_filtered <- next_data %>%
+  filter(!is.na(best_bid) & !is.na(best_offer)) %>%
+  mutate(otm_put = if_else(cp_flag == "P" & strike_price < k0, TRUE, FALSE),
+         otm_call = if_else(cp_flag == "C" & strike_price > k0, TRUE, FALSE)) %>%
+  filter((otm_put) | (otm_call) | strike_price == k0)
+
+filtered_puts_next <- next_data_filtered %>%
+  filter(otm_put) %>%                      # Ensure only OTM puts are considered
+  group_by(date) %>%
+  arrange(-strike_price, .by_group = TRUE)  %>%  # Sort by strike price within each date
+  mutate(
+    consec_zero_bid = (lag(best_bid == 0, default = FALSE) & best_bid == 0), # Identify consecutive zero bids
+    exclude_after = cumsum(consec_zero_bid) >= 1  # Track the first occurrence and mark all following rows
+  ) %>% filter(!exclude_after)%>% filter(best_bid != 0) %>%
+  ungroup()
+filtered_puts_next$price <- (filtered_puts_next$best_bid + filtered_puts_next$best_offer)/2
+
+filtered_calls_next <- next_data_filtered %>%
+  filter(otm_call) %>%                      # Ensure only OTM puts are considered
+  group_by(date) %>%
+  arrange(strike_price, .by_group = TRUE)  %>%  # Sort by strike price within each date
+  mutate(
+    consec_zero_bid = (lag(best_bid == 0, default = FALSE) & best_bid == 0), # Identify consecutive zero bids
+    exclude_after = cumsum(consec_zero_bid) >= 1  # Track the first occurrence and mark all following rows
+  )%>% filter(!exclude_after)%>% filter(best_bid != 0)  %>% ungroup()
+filtered_calls_next$price <- (filtered_calls_next$best_bid + filtered_calls_next$best_offer)/2
+
+options_at_k0_next <- next_data_filtered %>% filter(strike_price == k0)
+options_at_k0_next$price <- (options_at_k0_next$best_bid + options_at_k0_next$best_offer)/2
+
+options_at_k0_wide_next <- pivot_wider(
+    data = options_at_k0_next,
+    id_cols = c(date, exdate, strike_price, k0),  # Use 'strike_price' as the identifier column
+    names_from = cp_flag,  # Use 'cp_flag' to determine new column names for 'P' and 'C'
+    values_from = price,  # The columns to spread into new columns
+    names_sep = "_"  # Separator for new column names
+) %>% mutate(cp_flag = "CP at K0", price = (C+P)/2) %>% select(date, exdate, strike_price, cp_flag, price, k0)
+
+
+
+
+final_data_next <- bind_rows(select(filtered_puts_next, date, exdate, strike_price, cp_flag, price, k0), 
+                        select(filtered_calls_next, date, exdate, strike_price, cp_flag, price, k0), 
+                        options_at_k0_wide_next)
+#final_data_next %>% group_by(date, exdate) %>% arrange(strike_price, .by_group = TRUE) %>% ungroup() %>% select(date, exdate, strike_price,  cp_flag, k0, price) %>% View()
+
+```
+
+
+##  Calculating Volatility for near term
+```{r}
+final_data <- final_data %>%
+  arrange(date, exdate, strike_price) %>%  # Ensure data is sorted
+  group_by(date, exdate) %>%  # Group by date and expiration date
+  mutate(
+    next_strike = lead(strike_price),  # Get the next strike price
+    prev_strike = lag(strike_price),  # Get the previous strike price
+    deltaK = case_when(
+      row_number() == 1 ~ next_strike - strike_price,  # For the first row in each group
+      row_number() == n() ~ strike_price - prev_strike,  # For the last row in each group
+      TRUE ~ (next_strike - prev_strike) / 2  # For all other rows
+    )) %>% ungroup() 
+
+final_data <- final_data %>% left_join(T12, by = "date")
+final_data <- final_data %>% left_join(select(F1_data, date, rate, F1), by = c("date"))
+
+final_data <- final_data %>%
+  mutate(
+    # Convert strike_price to numeric to prevent integer overflow
+    strike_price = as.numeric(strike_price),
+    # Calculate the contribution of each option to VIX or similar index
+    contribu = deltaK / (strike_price^2) * exp(rate * T1) * price  # Rate adjusted by dividing by 100 if it's in percent
+  )
+final_data <- final_data %>% group_by(date) %>% mutate(sigma1_square = (sum(contribu)*2 - (F1/k0 - 1) * (F1/k0 - 1) )/T1)
+
+# Compute the variance of 'sigma1_square' within each date group
+sigma_variance_check <- final_data %>%
+  group_by(date) %>%
+  summarise(
+    sigma_variance = var(sigma1_square, na.rm = TRUE),  # Compute variance, remove NA values
+    count = n()  # Count the number of observations in each group
+  ) %>%
+  mutate(
+    all_identical = sigma_variance == 0 | count == 1  # Check if variance is zero or only one observation per group
+  )
+
+# Create a new dataframe with the unique sigma1_square value for each date
+sigma1_square_per_date <- final_data %>%
+  group_by(date) %>%
+  summarise(
+    date = first(date),
+    sigma1_square = first(sigma1_square)  # Since all values are the same, take the first one
+  )
+```
+
+##  Calculating Volatility for next term
+```{r}
+final_data_next <- final_data_next %>%
+  arrange(date, exdate, strike_price) %>%  # Ensure data is sorted
+  group_by(date, exdate) %>%  # Group by date and expiration date
+  mutate(
+    next_strike = lead(strike_price),  # Get the next strike price
+    prev_strike = lag(strike_price),  # Get the previous strike price
+    deltaK = case_when(
+      row_number() == 1 ~ next_strike - strike_price,  # For the first row in each group
+      row_number() == n() ~ strike_price - prev_strike,  # For the last row in each group
+      TRUE ~ (next_strike - prev_strike) / 2  # For all other rows
+    )
+  ) %>%
+  ungroup() 
+
+final_data_next <- final_data_next %>% left_join(T12, by = "date")
+final_data_next <- final_data_next %>% left_join(select(F2_data, date, rate, F2), by = c("date"))
+
+final_data_next <- final_data_next %>%
+  mutate(
+    # Convert strike_price to numeric to prevent integer overflow
+    strike_price = as.numeric(strike_price),
+    # Calculate the contribution of each option to VIX or similar index
+    contribu = deltaK / (strike_price^2) * exp(rate * T2) * price  # Rate adjusted by dividing by 100 if it's in percent
+  )
+final_data_next <- final_data_next %>% group_by(date) %>% mutate(sigma2_square = (sum(contribu)*2 - (F2/k0 - 1) * (F2/k0 - 1) )/T2)
+
+# Create a new dataframe with the unique sigma1_square value for each date
+sigma2_square_per_date <- final_data_next %>%
+  group_by(date) %>%
+  summarise(
+    date = first(date),
+    sigma2_square = first(sigma2_square)  # Since all values are the same, take the first one
+  )
+```
+
+##  Constant Maturity Term
+```{r}
+M <- select(near_and_next, date, exdate, next_exdate)
+colnames(M) <- c("date", "MT1", "MT2")
+M$MT1 <- (M$MT1 - M$date) %>% as.numeric()
+M$MT2 <- (M$MT2 - M$date) %>% as.numeric()
+M$MCM <- constant_maturity_term
+combined_sigma_data <- M %>%
+  left_join(sigma1_square_per_date, by = "date") %>%
+  left_join(sigma2_square_per_date, by = "date") %>% 
+  left_join(T12, by = "date")
+
+Vix <- 100 * (combined_sigma_data$T1 * combined_sigma_data$sigma1_square * (combined_sigma_data$MT2 -  combined_sigma_data$MCM)/(combined_sigma_data$MT2 - combined_sigma_data$MT1) + combined_sigma_data$T1 * combined_sigma_data$sigma2_square * (combined_sigma_data$MCM -  combined_sigma_data$MT1)/(combined_sigma_data$MT2 - combined_sigma_data$MT1))^0.5
+Vix
+
+```
+
+## compare result
+```{r}
+ref <- vixts %>% filter((Date >= 20190101)&(Date <= 20190630)) %>% select(VIX_1.2) %>% sqrt() * 100
+cor(ref, Vix)
+```
+
