@@ -6,7 +6,6 @@ This project, titled "CBOE VIX Implementation," is an R implementation of the Vo
 ## Features
 - **Data Extraction**: Scripts to pull options data from relevant sources.
 - **Volatility Calculation**: Routines to calculate the VIX based on the methodology outlined by CBOE.
-- **Visualization**: Code to generate plots and charts of the VIX over time to analyze trends and spikes in volatility.
 
 ## Getting Started
 To run this project, you need R and RStudio installed on your machine. Download the project files to your local machine, open the `.Rproj` file with RStudio, and execute the scripts in the order specified in the `scripts` folder.
